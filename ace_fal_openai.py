@@ -68,8 +68,9 @@ def _tensor_to_pil(x: torch.Tensor) -> Image.Image:
 
 
 def _pil_to_tensor_rgb(pil: Image.Image) -> torch.Tensor:
-    arr = np.asarray(pil.convert("RGB"), dtype=np.float32) / 255.0
-    return torch.from_numpy(arr)[None, ...]
+    pil.load()  # force full decode before buffer reuse
+    arr = np.array(pil.convert("RGB"), dtype=np.float32, copy=True) / 255.0
+    return torch.from_numpy(np.ascontiguousarray(arr))[None, ...]
 
 
 def _placeholder(size: int = 512) -> torch.Tensor:
@@ -169,21 +170,20 @@ def _resolve_size(image_size: str, custom_width: int, custom_height: int, log: L
     return image_size
 
 
-def _common_payload(prompt, size_val, background, quality, num_images, output_format, output_compression):
-    payload = {
+def _common_payload(prompt, size_val, background, quality, num_images):
+    return {
         "prompt": prompt,
         "image_size": size_val,
         "background": background,
         "quality": quality,
         "num_images": int(num_images),
-        "output_format": output_format,
+        "output_format": "png",  # always fetch lossless master; local conversion covers jpg/webp
     }
-    if output_format in ("jpeg", "webp") and 0 <= int(output_compression) <= 100:
-        payload["output_compression"] = int(output_compression)
-    return payload
 
 
-def _run_generation(endpoint: str, key: str, payload: dict, save_raw: bool, tag: str):
+def _run_generation(endpoint: str, key: str, payload: dict, save_raw: bool, tag: str,
+                    out_png: bool = True, out_jpg: bool = False, out_webp: bool = False,
+                    jpg_webp_quality: int = 90):
     log: List[str] = []
     t0 = time.time()
     data = _fal_post(endpoint, key, payload)
@@ -193,8 +193,11 @@ def _run_generation(endpoint: str, key: str, payload: dict, save_raw: bool, tag:
     if not images:
         raise RuntimeError(f"No images returned. Response: {json.dumps(data)[:1500]}")
 
+    if not (out_png or out_jpg or out_webp):
+        out_png = True
+        log.append("no format ticked; defaulting to png")
+
     stamp = time.strftime("%Y%m%d_%H%M%S")
-    ext = {"jpeg": "jpg"}.get(payload.get("output_format", "png"), payload.get("output_format", "png"))
     pils: List[Image.Image] = []
     raw_paths: List[str] = []
     for idx, meta in enumerate(images):
@@ -202,11 +205,28 @@ def _run_generation(endpoint: str, key: str, payload: dict, save_raw: bool, tag:
         if not url:
             continue
         raw = _download(url)
-        pils.append(Image.open(BytesIO(raw)))
+        pil = Image.open(BytesIO(raw))
+        pil.load()
+        pils.append(pil)
         if save_raw:
-            rp = _save_raw(raw, f"gpt25_{tag}_{stamp}_{idx + 1:02d}.{ext}", log)
-            if rp:
-                raw_paths.append(rp)
+            base = f"gpt25_{tag}_{stamp}_{idx + 1:02d}"
+            if out_png:
+                rp = _save_raw(raw, f"{base}.png", log)  # untouched API bytes
+                if rp:
+                    raw_paths.append(rp)
+            try:
+                if out_jpg:
+                    p = os.path.join(_output_dir(), f"{base}.jpg")
+                    pil.convert("RGB").save(p, "JPEG", quality=int(jpg_webp_quality))
+                    raw_paths.append(p)
+                    log.append(f"saved -> {p}")
+                if out_webp:
+                    p = os.path.join(_output_dir(), f"{base}.webp")
+                    pil.save(p, "WEBP", quality=int(jpg_webp_quality))
+                    raw_paths.append(p)
+                    log.append(f"saved -> {p}")
+            except Exception as e:
+                log.append(f"format conversion failed: {e}")
 
     log.append(f"{len(pils)} image(s) generated")
     return _stack_rgb(pils), "\n".join(raw_paths), "\n".join(log)
@@ -235,11 +255,10 @@ class _AceGPT25T2IBase:
             "optional": {
                 "background": (BACKGROUND_OPTIONS, {"default": "auto"}),
                 "num_images": ("INT", {"default": 1, "min": 1, "max": 10}),
-                "output_format": (FORMAT_OPTIONS, {"default": "png"}),
-                "output_compression": (
-                    "INT",
-                    {"default": 100, "min": 0, "max": 100, "tooltip": "Only applies to jpeg/webp"},
-                ),
+                "out_png": ("BOOLEAN", {"default": True, "tooltip": "Save results as .png"}),
+                "out_jpg": ("BOOLEAN", {"default": False, "tooltip": "Also save results as .jpg"}),
+                "out_webp": ("BOOLEAN", {"default": False, "tooltip": "Also save results as .webp"}),
+                "jpg_webp_quality": ("INT", {"default": 90, "min": 1, "max": 100, "tooltip": "Quality for jpg/webp saves"}),
                 "custom_width": ("INT", {"default": 1024, "min": 480, "max": 3840, "step": 16}),
                 "custom_height": ("INT", {"default": 1024, "min": 480, "max": 3840, "step": 16}),
                 "save_raw": (
@@ -262,8 +281,10 @@ class _AceGPT25T2IBase:
         quality: str = "high",
         background: str = "auto",
         num_images: int = 1,
-        output_format: str = "png",
-        output_compression: int = 100,
+        out_png: bool = True,
+        out_jpg: bool = False,
+        out_webp: bool = False,
+        jpg_webp_quality: int = 90,
         custom_width: int = 1024,
         custom_height: int = 1024,
         save_raw: bool = True,
@@ -274,10 +295,11 @@ class _AceGPT25T2IBase:
             raise RuntimeError("Prompt is required.")
         log: List[str] = []
         size_val = _resolve_size(image_size, custom_width, custom_height, log)
-        payload = _common_payload(
-            prompt.strip(), size_val, background, quality, num_images, output_format, output_compression
+        payload = _common_payload(prompt.strip(), size_val, background, quality, num_images)
+        images, raw_paths, run_log = _run_generation(
+            self._ENDPOINT, key, payload, save_raw, self._TAG,
+            out_png, out_jpg, out_webp, jpg_webp_quality,
         )
-        images, raw_paths, run_log = _run_generation(self._ENDPOINT, key, payload, save_raw, self._TAG)
         return (images, raw_paths, ("\n".join(log) + "\n" + run_log).strip())
 
 
@@ -297,11 +319,10 @@ class _AceGPT25EditBase:
             ),
             "background": (BACKGROUND_OPTIONS, {"default": "auto"}),
             "num_images": ("INT", {"default": 1, "min": 1, "max": 10}),
-            "output_format": (FORMAT_OPTIONS, {"default": "png"}),
-            "output_compression": (
-                "INT",
-                {"default": 100, "min": 0, "max": 100, "tooltip": "Only applies to jpeg/webp"},
-            ),
+            "out_png": ("BOOLEAN", {"default": True, "tooltip": "Save results as .png"}),
+            "out_jpg": ("BOOLEAN", {"default": False, "tooltip": "Also save results as .jpg"}),
+            "out_webp": ("BOOLEAN", {"default": False, "tooltip": "Also save results as .webp"}),
+            "jpg_webp_quality": ("INT", {"default": 90, "min": 1, "max": 100, "tooltip": "Quality for jpg/webp saves"}),
             "custom_width": ("INT", {"default": 1024, "min": 480, "max": 3840, "step": 16}),
             "custom_height": ("INT", {"default": 1024, "min": 480, "max": 3840, "step": 16}),
             "save_raw": (
@@ -344,8 +365,10 @@ class _AceGPT25EditBase:
         quality: str = "high",
         background: str = "auto",
         num_images: int = 1,
-        output_format: str = "png",
-        output_compression: int = 100,
+        out_png: bool = True,
+        out_jpg: bool = False,
+        out_webp: bool = False,
+        jpg_webp_quality: int = 90,
         custom_width: int = 1024,
         custom_height: int = 1024,
         save_raw: bool = True,
@@ -371,9 +394,7 @@ class _AceGPT25EditBase:
             image_urls = image_urls[:16]
 
         size_val = _resolve_size(image_size, custom_width, custom_height, log)
-        payload = _common_payload(
-            prompt.strip(), size_val, background, quality, num_images, output_format, output_compression
-        )
+        payload = _common_payload(prompt.strip(), size_val, background, quality, num_images)
         payload["image_urls"] = image_urls
 
         mask = kwargs.get("mask")
@@ -381,7 +402,10 @@ class _AceGPT25EditBase:
             payload["mask_url"] = _mask_to_data_uri(mask)
             log.append("mask attached (white = editable, sent as transparency)")
 
-        images, raw_paths, run_log = _run_generation(self._ENDPOINT, key, payload, save_raw, self._TAG)
+        images, raw_paths, run_log = _run_generation(
+            self._ENDPOINT, key, payload, save_raw, self._TAG,
+            out_png, out_jpg, out_webp, jpg_webp_quality,
+        )
         return (images, raw_paths, ("\n".join(log) + "\n" + run_log).strip())
 
 
